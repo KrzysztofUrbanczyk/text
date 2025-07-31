@@ -1,0 +1,166 @@
+    public QueryFactory(GrpcChannel channel, IMemoryCache cache)
+    {
+        _client = new QueryService.QueryServiceClient(channel);
+        _cache = cache;
+        _serializer = new BinaryExpressionSerializer();
+    }
+
+    public IQueryable<T> Queryable<T>()
+    {
+        return new RemoteQueryable<T>(_client, _cache, _serializer);
+    }
+}
+
+public class RemoteQueryable<T> : IQueryable<T>
+{
+    private readonly QueryService.QueryServiceClient _client;
+    private readonly IMemoryCache _cache;
+    private readonly BinaryExpressionSerializer _serializer;
+
+    public RemoteQueryable(QueryService.QueryServiceClient client, IMemoryCache cache, BinaryExpressionSerializer serializer)
+    {
+        _client = client;
+        _cache = cache;
+        _serializer = serializer;
+        Expression = Expression.Constant(this);
+        Provider = new RemoteLinqQueryProvider<T>(_client, _cache, _serializer);
+    }
+
+    public Type ElementType => typeof(T);
+    public Expression Expression { get; }
+    public IQueryProvider Provider { get; }
+
+    public IEnumerator<T> GetEnumerator()
+    {
+        // Execute query remotely and return results
+        var results = Provider.Execute<IEnumerable<T>>(Expression);
+        return results.GetEnumerator();
+    }
+
+    IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
+}
+
+public class RemoteLinqQueryProvider<T> : IQueryProvider
+{
+    private readonly QueryService.QueryServiceClient _client;
+    private readonly IMemoryCache _cache;
+    private readonly BinaryExpressionSerializer _serializer;
+
+    public RemoteLinqQueryProvider(QueryService.QueryServiceClient client, IMemoryCache cache, BinaryExpressionSerializer serializer)
+    {
+        _client = client;
+        _cache = cache;
+        _serializer = serializer;
+    }
+
+    public IQueryable CreateQuery(Expression expression)
+    {
+        return new RemoteQueryable<T>(_client, _cache, _serializer) { Expression = expression };
+    }
+
+    public IQueryable<TElement> CreateQuery<TElement>(Expression expression)
+    {
+        return new RemoteQueryable<TElement>(_client, _cache, _serializer) { Expression = expression };
+    }
+
+    public object Execute(Expression expression)
+    {
+        return Execute<IEnumerable<T>>(expression);
+    }
+
+    public TResult Execute<TResult>(Expression expression)
+    {
+        try
+        {
+            // Cache serialized expression
+            var cacheKey = expression.ToString();
+            var serializedExpression = _cache.GetOrCreate(cacheKey, entry =>
+            {
+                entry.SlidingExpiration = TimeSpan.FromMinutes(5);
+                return _serializer.Serialize(expression);
+            });
+
+            // Send query to server
+            var request = new QueryRequest
+            {
+                EntityType = typeof(T).Name,
+                SerializedExpression = ByteString.CopyFrom(serializedExpression)
+            };
+
+            var response = _client.ExecuteQuery(request); // Synchronous for simplicity; use ExecuteQueryAsync for async
+
+            // Deserialize results
+            if (typeof(TResult).IsGenericType && typeof(TResult).GetGenericTypeDefinition() == typeof(IEnumerable<>))
+            {
+                var elementType = typeof(TResult).GetGenericArguments()[0];
+                if (elementType == typeof(string)) // Handle your specific case: Select(x => x.Id)
+                {
+                    return (TResult)(object)response.Results.ToList();
+                }
+                // Add handling for other types if needed
+                throw new NotSupportedException($"Result type {elementType.Name} is not supported.");
+            }
+
+            throw new NotSupportedException($"Result type {typeof(TResult).Name} is not supported.");
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException($"Failed to execute query: {ex.Message}", ex);
+        }
+    }
+
+    // Async version for ToListAsync
+    public async Task<TResult> ExecuteAsync<TResult>(Expression expression)
+    {
+        try
+        {
+            // Cache serialized expression
+            var cacheKey = expression.ToString();
+            var serializedExpression = _cache.GetOrCreate(cacheKey, entry =>
+            {
+                entry.SlidingExpiration = TimeSpan.FromMinutes(5);
+                return _serializer.Serialize(expression);
+            });
+
+            // Send query to server
+            var request = new QueryRequest
+            {
+                EntityType = typeof(T).Name,
+                SerializedExpression = ByteString.CopyFrom(serializedExpression)
+            };
+
+            var response = await _client.ExecuteQueryAsync(request);
+
+            // Deserialize results
+            if (typeof(TResult).IsGenericType && typeof(TResult).GetGenericTypeDefinition() == typeof(IEnumerable<>))
+            {
+                var elementType = typeof(TResult).GetGenericArguments()[0];
+                if (elementType == typeof(string)) // Handle your specific case: Select(x => x.Id)
+                {
+                    return (TResult)(object)response.Results.ToList();
+                }
+                // Add handling for other types if needed
+                throw new NotSupportedException($"Result type {elementType.Name} is not supported.");
+            }
+
+            throw new NotSupportedException($"Result type {typeof(TResult).Name} is not supported.");
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException($"Failed to execute query: {ex.Message}", ex);
+        }
+    }
+}
+
+// Extension method to support ToListAsync
+public static class RemoteQueryableExtensions
+{
+    public static Task<List<T>> ToListAsync<T>(this IQueryable<T> source)
+    {
+        if (source.Provider is RemoteLinqQueryProvider<T> provider)
+        {
+            return provider.ExecuteAsync<List<T>>(source.Expression);
+        }
+        throw new NotSupportedException("ToListAsync is only supported for RemoteLinqQueryProvider.");
+    }
+}
